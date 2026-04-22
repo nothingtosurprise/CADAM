@@ -130,6 +130,25 @@ function markToolAsError(content: Content, toolId: string): Content {
   };
 }
 
+// Helper to flip every still-`pending` tool call to `error`. Used at terminal
+// checkpoints so an aborted request never persists a forever-streaming bubble.
+function markPendingToolsAsError(content: Content): Content {
+  if (!content.toolCalls || content.toolCalls.length === 0) return content;
+  const hasPending = content.toolCalls.some((c) => c.status === 'pending');
+  if (!hasPending) return content;
+  return {
+    ...content,
+    toolCalls: content.toolCalls.map((c: ToolCall) =>
+      c.status === 'pending' ? { ...c, status: 'error' } : c,
+    ),
+  };
+}
+
+// Supabase edge functions have a wall-clock budget (~400s on Pro). Abort
+// upstream fetches well before that so the server-side error paths run and
+// flush a terminal state, instead of the runtime killing us mid-stream.
+const UPSTREAM_FETCH_TIMEOUT_MS = 4 * 60 * 1000;
+
 // Anthropic block types for type safety
 interface AnthropicTextBlock {
   type: 'text';
@@ -640,6 +659,14 @@ Deno.serve(async (req) => {
       requestBody.max_tokens = 20000;
     }
 
+    // Matched to the code-gen budget so neither upstream can outlive
+    // the Supabase wall-clock silently.
+    const agentAbort = new AbortController();
+    const agentTimeout = setTimeout(
+      () => agentAbort.abort(new Error('agent upstream timeout')),
+      UPSTREAM_FETCH_TIMEOUT_MS,
+    );
+
     const response = await fetch(OPENROUTER_API_URL, {
       method: 'POST',
       headers: {
@@ -649,9 +676,11 @@ Deno.serve(async (req) => {
         'X-Title': 'Adam CAD',
       },
       body: JSON.stringify(requestBody),
+      signal: agentAbort.signal,
     });
 
     if (!response.ok) {
+      clearTimeout(agentTimeout);
       const errorText = await response.text();
       console.error(`OpenRouter API Error: ${response.status} - ${errorText}`);
       throw new Error(
@@ -804,6 +833,11 @@ Deno.serve(async (req) => {
           }
           markAllToolsError();
         } finally {
+          clearTimeout(agentTimeout);
+          // Last-line defense: even if markAllToolsError was skipped (e.g.
+          // the outer try completed without throwing but a tool call was
+          // left pending by an unreachable path), never persist pending.
+          content = markPendingToolsAsError(content);
           // Fallback: If no artifact was created but text contains OpenSCAD code,
           // extract it and create an artifact. This handles cases where the LLM
           // outputs code directly instead of using tools (common in long conversations).
@@ -890,246 +924,285 @@ Deno.serve(async (req) => {
           arguments: string;
         }) {
           if (toolCall.name === 'build_parametric_model') {
-            // Deduct parametric tokens (5) for model building
+            // `resolved` tracks whether this tool call reached a terminal
+            // state (success = entry removed, or explicit `error`). The
+            // finally below guarantees that *every* exit — throw, early
+            // return, upstream hang unmasked by AbortController — leaves
+            // the persisted tool call as `error` rather than forever-
+            // pending. Without this, a mid-stream kill produces a message
+            // that renders as a perpetually streaming code block.
+            let resolved = false;
             try {
-              const paramResult = await billing.consume(userData.user!.email!, {
-                tokens: PARAMETRIC_TOKEN_COST,
-                operation: 'parametric',
-                referenceId: toolCall.id,
-              });
-              if (!paramResult.ok) {
+              // Deduct parametric tokens (5) for model building
+              try {
+                const paramResult = await billing.consume(
+                  userData.user!.email!,
+                  {
+                    tokens: PARAMETRIC_TOKEN_COST,
+                    operation: 'parametric',
+                    referenceId: toolCall.id,
+                  },
+                );
+                if (!paramResult.ok) {
+                  content = {
+                    ...markToolAsError(content, toolCall.id),
+                    error: 'insufficient_tokens',
+                  };
+                  streamMessage(controller, { ...newMessageData, content });
+                  resolved = true;
+                  return;
+                }
+              } catch (err) {
+                const status =
+                  err instanceof BillingClientError ? err.status : 502;
+                logError(err, {
+                  functionName: 'parametric-chat',
+                  statusCode: status,
+                  userId: userData.user?.id,
+                  conversationId,
+                  additionalContext: {
+                    operation: 'parametric',
+                    toolCallId: toolCall.id,
+                  },
+                });
                 content = {
-                  ...content,
-                  error: 'insufficient_tokens',
+                  ...markToolAsError(content, toolCall.id),
+                  error: 'billing_unavailable',
                 };
                 streamMessage(controller, { ...newMessageData, content });
+                resolved = true;
                 return;
               }
-            } catch (err) {
-              const status =
-                err instanceof BillingClientError ? err.status : 502;
-              logError(err, {
-                functionName: 'parametric-chat',
-                statusCode: status,
-                userId: userData.user?.id,
-                conversationId,
-                additionalContext: {
-                  operation: 'parametric',
-                  toolCallId: toolCall.id,
-                },
-              });
-              content = {
-                ...content,
-                error: 'billing_unavailable',
-              };
-              streamMessage(controller, { ...newMessageData, content });
-              return;
-            }
-            let toolInput: {
-              text?: string;
-              imageIds?: string[];
-              baseCode?: string;
-              error?: string;
-            } = {};
-            try {
-              toolInput = JSON.parse(toolCall.arguments);
-            } catch (e) {
-              console.error('Invalid tool input JSON', e);
-              content = markToolAsError(content, toolCall.id);
-              streamMessage(controller, { ...newMessageData, content });
-              return;
-            }
-
-            // Build code generation messages
-            const baseContext: OpenAIMessage[] = toolInput.baseCode
-              ? [{ role: 'assistant' as const, content: toolInput.baseCode }]
-              : [];
-
-            // If baseContext adds an assistant message, re-state user request so conversation ends with user
-            const userText = newMessage?.content.text || '';
-            const needsUserMessage = baseContext.length > 0 || toolInput.error;
-            const finalUserMessage: OpenAIMessage[] = needsUserMessage
-              ? [
-                  {
-                    role: 'user' as const,
-                    content: toolInput.error
-                      ? `${userText}\n\nFix this OpenSCAD error: ${toolInput.error}`
-                      : userText,
-                  },
-                ]
-              : [];
-
-            const codeMessages: OpenAIMessage[] = [
-              ...messagesToSend,
-              ...baseContext,
-              ...finalUserMessage,
-            ];
-
-            // Code generation request logic (SSE streaming)
-            const codeRequestBody: OpenRouterRequest = {
-              model,
-              messages: [
-                { role: 'system', content: STRICT_CODE_PROMPT },
-                ...codeMessages,
-              ],
-              max_tokens: 48000,
-              stream: true,
-            };
-
-            // Also apply thinking to code generation if enabled
-            if (thinking) {
-              codeRequestBody.reasoning = {
-                max_tokens: 12000,
-              };
-              codeRequestBody.max_tokens = 60000;
-            }
-
-            // Kick off title generation alongside the streamed code.
-            const titlePromise = generateTitleFromMessages(messagesToSend);
-
-            let rawCode = '';
-            let codeGenFailed = false;
-
-            const stripCodeFences = (s: string): string => {
-              let out = s;
-              out = out.replace(/^```(?:openscad)?\s*\n?/, '');
-              out = out.replace(/\n?```\s*$/, '');
-              return out;
-            };
-
-            try {
-              const codeResponse = await fetch(OPENROUTER_API_URL, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-                  'HTTP-Referer': 'https://adam-cad.com',
-                  'X-Title': 'Adam CAD',
-                },
-                body: JSON.stringify(codeRequestBody),
-              });
-
-              if (!codeResponse.ok) {
-                const t = await codeResponse.text();
-                throw new Error(
-                  `Code gen error: ${codeResponse.status} - ${t}`,
-                );
+              let toolInput: {
+                text?: string;
+                imageIds?: string[];
+                baseCode?: string;
+                error?: string;
+              } = {};
+              try {
+                toolInput = JSON.parse(toolCall.arguments);
+              } catch (e) {
+                console.error('Invalid tool input JSON', e);
+                content = markToolAsError(content, toolCall.id);
+                streamMessage(controller, { ...newMessageData, content });
+                resolved = true;
+                return;
               }
 
-              const codeReader = codeResponse.body?.getReader();
-              if (!codeReader) throw new Error('No code response body');
+              // Build code generation messages
+              const baseContext: OpenAIMessage[] = toolInput.baseCode
+                ? [{ role: 'assistant' as const, content: toolInput.baseCode }]
+                : [];
 
-              const codeDecoder = new TextDecoder();
-              let codeBuffer = '';
-              // Throttle SSE flushes to avoid O(n^2) memory blow-up on long
-              // generations — without this, each of hundreds of deltas
-              // re-serializes the full accumulated artifact.
-              let lastFlushTime = 0;
-              let lastFlushedLen = 0;
-              const FLUSH_INTERVAL_MS = 120;
+              // If baseContext adds an assistant message, re-state user request so conversation ends with user
+              const userText = newMessage?.content.text || '';
+              const needsUserMessage =
+                baseContext.length > 0 || toolInput.error;
+              const finalUserMessage: OpenAIMessage[] = needsUserMessage
+                ? [
+                    {
+                      role: 'user' as const,
+                      content: toolInput.error
+                        ? `${userText}\n\nFix this OpenSCAD error: ${toolInput.error}`
+                        : userText,
+                    },
+                  ]
+                : [];
 
-              while (true) {
-                const { done, value } = await codeReader.read();
-                if (done) break;
+              const codeMessages: OpenAIMessage[] = [
+                ...messagesToSend,
+                ...baseContext,
+                ...finalUserMessage,
+              ];
 
-                codeBuffer += codeDecoder.decode(value, { stream: true });
-                const codeLines = codeBuffer.split('\n');
-                codeBuffer = codeLines.pop() || '';
+              // Code generation request logic (SSE streaming)
+              const codeRequestBody: OpenRouterRequest = {
+                model,
+                messages: [
+                  { role: 'system', content: STRICT_CODE_PROMPT },
+                  ...codeMessages,
+                ],
+                max_tokens: 48000,
+                stream: true,
+              };
 
-                for (const line of codeLines) {
-                  // Skip empty lines, SSE comments (`: OPENROUTER PROCESSING`),
-                  // and anything that isn't a `data:` event.
-                  if (!line.startsWith('data: ')) continue;
-                  const data = line.slice(6);
-                  if (data === '[DONE]') continue;
+              // Also apply thinking to code generation if enabled
+              if (thinking) {
+                codeRequestBody.reasoning = {
+                  max_tokens: 12000,
+                };
+                codeRequestBody.max_tokens = 60000;
+              }
 
-                  let chunk: {
-                    error?: { message?: string };
-                    choices?: Array<{
-                      delta?: { content?: string };
-                    }>;
-                  };
-                  try {
-                    chunk = JSON.parse(data);
-                  } catch (e) {
-                    // Malformed chunk — log and skip, don't abort the stream.
-                    console.error('Error parsing code SSE chunk:', e);
-                    continue;
-                  }
+              // Kick off title generation alongside the streamed code.
+              const titlePromise = generateTitleFromMessages(messagesToSend);
 
-                  // Surfaced API errors must abort code-gen so the outer
-                  // catch can mark the tool call as failed — never swallow.
-                  if (chunk.error) {
-                    throw new Error(
-                      chunk.error.message ||
-                        `OpenRouter error: ${JSON.stringify(chunk.error)}`,
-                    );
-                  }
+              let rawCode = '';
+              let codeGenFailed = false;
 
-                  const deltaContent = chunk.choices?.[0]?.delta?.content;
-                  if (typeof deltaContent === 'string' && deltaContent) {
-                    rawCode += deltaContent;
-                    const now = Date.now();
-                    if (
-                      now - lastFlushTime >= FLUSH_INTERVAL_MS &&
-                      rawCode.length > lastFlushedLen
-                    ) {
-                      const streamed = stripCodeFences(rawCode);
-                      content = {
-                        ...content,
-                        artifact: {
-                          title: 'Adam Object',
-                          version: 'v1',
-                          code: streamed,
-                          parameters: [],
-                        },
-                      };
-                      streamMessage(controller, {
-                        ...newMessageData,
-                        content,
-                      });
-                      lastFlushTime = now;
-                      lastFlushedLen = rawCode.length;
+              const stripCodeFences = (s: string): string => {
+                let out = s;
+                out = out.replace(/^```(?:openscad)?\s*\n?/, '');
+                out = out.replace(/\n?```\s*$/, '');
+                return out;
+              };
+
+              // Hard timeout below the Supabase edge budget so a hung
+              // upstream aborts in userland, letting the catch below mark
+              // this tool call as `error` instead of being silently SIGKILLed.
+              const codeGenAbort = new AbortController();
+              const codeGenTimeout = setTimeout(
+                () =>
+                  codeGenAbort.abort(new Error('code-gen upstream timeout')),
+                UPSTREAM_FETCH_TIMEOUT_MS,
+              );
+              try {
+                const codeResponse = await fetch(OPENROUTER_API_URL, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+                    'HTTP-Referer': 'https://adam-cad.com',
+                    'X-Title': 'Adam CAD',
+                  },
+                  body: JSON.stringify(codeRequestBody),
+                  signal: codeGenAbort.signal,
+                });
+
+                if (!codeResponse.ok) {
+                  const t = await codeResponse.text();
+                  throw new Error(
+                    `Code gen error: ${codeResponse.status} - ${t}`,
+                  );
+                }
+
+                const codeReader = codeResponse.body?.getReader();
+                if (!codeReader) throw new Error('No code response body');
+
+                const codeDecoder = new TextDecoder();
+                let codeBuffer = '';
+                // Throttle SSE flushes to avoid O(n^2) memory blow-up on long
+                // generations — without this, each of hundreds of deltas
+                // re-serializes the full accumulated artifact.
+                let lastFlushTime = 0;
+                let lastFlushedLen = 0;
+                const FLUSH_INTERVAL_MS = 120;
+
+                while (true) {
+                  const { done, value } = await codeReader.read();
+                  if (done) break;
+
+                  codeBuffer += codeDecoder.decode(value, { stream: true });
+                  const codeLines = codeBuffer.split('\n');
+                  codeBuffer = codeLines.pop() || '';
+
+                  for (const line of codeLines) {
+                    // Skip empty lines, SSE comments (`: OPENROUTER PROCESSING`),
+                    // and anything that isn't a `data:` event.
+                    if (!line.startsWith('data: ')) continue;
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+
+                    let chunk: {
+                      error?: { message?: string };
+                      choices?: Array<{
+                        delta?: { content?: string };
+                      }>;
+                    };
+                    try {
+                      chunk = JSON.parse(data);
+                    } catch (e) {
+                      // Malformed chunk — log and skip, don't abort the stream.
+                      console.error('Error parsing code SSE chunk:', e);
+                      continue;
+                    }
+
+                    // Surfaced API errors must abort code-gen so the outer
+                    // catch can mark the tool call as failed — never swallow.
+                    if (chunk.error) {
+                      throw new Error(
+                        chunk.error.message ||
+                          `OpenRouter error: ${JSON.stringify(chunk.error)}`,
+                      );
+                    }
+
+                    const deltaContent = chunk.choices?.[0]?.delta?.content;
+                    if (typeof deltaContent === 'string' && deltaContent) {
+                      rawCode += deltaContent;
+                      const now = Date.now();
+                      if (
+                        now - lastFlushTime >= FLUSH_INTERVAL_MS &&
+                        rawCode.length > lastFlushedLen
+                      ) {
+                        const streamed = stripCodeFences(rawCode);
+                        content = {
+                          ...content,
+                          artifact: {
+                            title: 'Adam Object',
+                            version: 'v1',
+                            code: streamed,
+                            parameters: [],
+                          },
+                        };
+                        streamMessage(controller, {
+                          ...newMessageData,
+                          content,
+                        });
+                        lastFlushTime = now;
+                        lastFlushedLen = rawCode.length;
+                      }
                     }
                   }
                 }
+              } catch (e) {
+                console.error('Code generation failed:', e);
+                codeGenFailed = true;
+              } finally {
+                clearTimeout(codeGenTimeout);
               }
-            } catch (e) {
-              console.error('Code generation failed:', e);
-              codeGenFailed = true;
+
+              const code = stripCodeFences(rawCode.trim()).trim();
+
+              let title = await titlePromise.catch(() => 'Adam Object');
+              const lower = title.toLowerCase();
+              if (lower.includes('sorry') || lower.includes('apologize'))
+                title = 'Adam Object';
+
+              if (codeGenFailed || !code) {
+                content = {
+                  ...content,
+                  artifact: undefined,
+                  toolCalls: (content.toolCalls || []).map((c) =>
+                    c.id === toolCall.id ? { ...c, status: 'error' } : c,
+                  ),
+                };
+              } else {
+                const artifact: ParametricArtifact = {
+                  title,
+                  version: 'v1',
+                  code,
+                  parameters: parseParameters(code),
+                };
+                content = {
+                  ...content,
+                  toolCalls: (content.toolCalls || []).filter(
+                    (c) => c.id !== toolCall.id,
+                  ),
+                  artifact,
+                };
+              }
+              streamMessage(controller, { ...newMessageData, content });
+              resolved = true;
+            } finally {
+              // Safety net: any escape from the block above (thrown error,
+              // forgotten return, upstream abort) that left this tool call
+              // `pending` gets flipped to `error` here so the DB write in
+              // the outer finally never persists a zombie pending state.
+              if (!resolved) {
+                content = markToolAsError(content, toolCall.id);
+                streamMessage(controller, { ...newMessageData, content });
+              }
             }
-
-            const code = stripCodeFences(rawCode.trim()).trim();
-
-            let title = await titlePromise.catch(() => 'Adam Object');
-            const lower = title.toLowerCase();
-            if (lower.includes('sorry') || lower.includes('apologize'))
-              title = 'Adam Object';
-
-            if (codeGenFailed || !code) {
-              content = {
-                ...content,
-                artifact: undefined,
-                toolCalls: (content.toolCalls || []).map((c) =>
-                  c.id === toolCall.id ? { ...c, status: 'error' } : c,
-                ),
-              };
-            } else {
-              const artifact: ParametricArtifact = {
-                title,
-                version: 'v1',
-                code,
-                parameters: parseParameters(code),
-              };
-              content = {
-                ...content,
-                toolCalls: (content.toolCalls || []).filter(
-                  (c) => c.id !== toolCall.id,
-                ),
-                artifact,
-              };
-            }
-            streamMessage(controller, { ...newMessageData, content });
           } else if (toolCall.name === 'apply_parameter_changes') {
             let toolInput: {
               updates?: Array<{ name: string; value: string }>;
@@ -1230,6 +1303,10 @@ Deno.serve(async (req) => {
         text: 'An error occurred while processing your request.',
       };
     }
+    // Symmetric to the stream's inner finally: if we bail before/around
+    // returning the ReadableStream with tool calls already populated,
+    // never leave a pending entry in the persisted row.
+    content = markPendingToolsAsError(content);
 
     const { data: updatedMessageData } = await supabaseClient
       .from('messages')
